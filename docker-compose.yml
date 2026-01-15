@@ -1,0 +1,294 @@
+version: '3.8'
+
+services:
+  # Databases
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+      POSTGRES_DB: studentdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./databases/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mongodb:
+    image: mongo:7
+    container_name: mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: admin123
+      MONGO_INITDB_DATABASE: studentdb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - ./databases/mongodb/init.js:/docker-entrypoint-initdb.d/init.js:ro
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Message Queue
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis (Celery broker)
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Backend Services
+  etl-service:
+    build:
+      context: ./services/etl-service
+      dockerfile: Dockerfile
+    container_name: etl-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+      POSTGRES_DB: studentdb
+      MONGO_HOST: mongodb
+      MONGO_PORT: 27017
+      MONGO_USER: admin
+      MONGO_PASSWORD: admin123
+      MONGO_DB: studentdb
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    volumes:
+      - ./services/etl-service:/app
+    command: python -m uvicorn main:app --host 0.0.0.0 --port 8001
+
+  monitoring-service:
+    build:
+      context: ./services/monitoring-service
+      dockerfile: Dockerfile
+    container_name: monitoring-service
+    depends_on:
+      - kafka
+      - redis
+      - postgres
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+      POSTGRES_DB: studentdb
+    volumes:
+      - ./services/monitoring-service:/app
+    command: python -m uvicorn main:app --host 0.0.0.0 --port 8002
+
+  query-service:
+    build:
+      context: ./services/query-service
+      dockerfile: Dockerfile
+    container_name: query-service
+    depends_on:
+      - kafka
+      - postgres
+      - vector-memory-service
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+      POSTGRES_DB: studentdb
+      VECTOR_MEMORY_URL: http://vector-memory-service:8005
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    ports:
+      - "8003:8003"
+    volumes:
+      - ./services/query-service:/app
+    command: python -m uvicorn main:app --host 0.0.0.0 --port 8003
+
+  self-healing-service:
+    build:
+      context: ./services/self-healing-service
+      dockerfile: Dockerfile
+    container_name: self-healing-service
+    depends_on:
+      - kafka
+      - redis
+      - postgres
+      - vector-memory-service
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+      POSTGRES_DB: studentdb
+      VECTOR_MEMORY_URL: http://vector-memory-service:8005
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    ports:
+      - "8004:8004"
+    volumes:
+      - ./services/self-healing-service:/app
+
+  vector-memory-service:
+    build:
+      context: ./services/vector-memory-service
+      dockerfile: Dockerfile
+    container_name: vector-memory-service
+    depends_on:
+      - postgres
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+      POSTGRES_DB: studentdb
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    ports:
+      - "8005:8005"
+    volumes:
+      - ./services/vector-memory-service:/app
+      - vector_index:/app/indexes
+    command: python -m uvicorn main:app --host 0.0.0.0 --port 8005
+
+  # Celery Worker for async tasks
+  celery-worker:
+    build:
+      context: ./services/monitoring-service
+      dockerfile: Dockerfile
+    container_name: celery-worker
+    depends_on:
+      - redis
+      - postgres
+      - kafka
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+      POSTGRES_DB: studentdb
+    volumes:
+      - ./services/monitoring-service:/app
+    command: celery -A tasks.celery_app worker --loglevel=info
+
+  # Frontend
+  frontend:
+    build:
+      context: ./services/frontend
+      dockerfile: Dockerfile
+    container_name: frontend
+    depends_on:
+      - query-service
+      - self-healing-service
+    ports:
+      - "3000:3000"
+    environment:
+      REACT_APP_QUERY_SERVICE_URL: http://localhost:8003
+      REACT_APP_SELF_HEALING_SERVICE_URL: http://localhost:8004
+    volumes:
+      - ./services/frontend:/app
+      - /app/node_modules
+
+  # Airflow
+  airflow-webserver:
+    image: apache/airflow:2.8.0
+    container_name: airflow-webserver
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://admin:admin123@postgres:5432/airflow
+      AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/0
+      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://admin:admin123@postgres:5432/airflow
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      _AIRFLOW_DB_UPGRADE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+    command: webserver
+
+  airflow-scheduler:
+    image: apache/airflow:2.8.0
+    container_name: airflow-scheduler
+    depends_on:
+      - airflow-webserver
+      - postgres
+      - redis
+    environment:
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://admin:admin123@postgres:5432/airflow
+      AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/0
+      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://admin:admin123@postgres:5432/airflow
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+    command: scheduler
+
+volumes:
+  postgres_data:
+  mongodb_data:
+  vector_index:
+  airflow_logs:
+
